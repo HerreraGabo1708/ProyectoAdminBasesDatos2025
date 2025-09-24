@@ -1,5 +1,5 @@
 from flask import Flask, jsonify
-from src.monitoring import get_cpu_memory, get_storage, get_top_queries, get_last_backup, recalculate_statistics, get_invalid_objects
+from backend.monitoring import get_cpu_memory, get_storage, get_top_queries, get_last_backup, recalculate_statistics, get_invalid_objects
 
 app = Flask(__name__)
 
