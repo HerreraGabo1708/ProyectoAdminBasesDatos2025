@@ -1,37 +1,37 @@
 from flask import Flask, jsonify
-from backend.monitoring import get_cpu_memory, get_storage, get_top_queries, get_last_backup, recalculate_statistics, get_invalid_objects
+from flask_cors import CORS  # opcional si usas proxy
+from backend.monitoring import (
+    get_cpu_memory, get_storage, get_top_queries,
+    get_last_backup, recalculate_statistics, get_invalid_objects
+)
 
 app = Flask(__name__)
+CORS(app, resources={r"/api/*": {"origins": "*"}})  # útil si algún día llamas sin proxy
 
-@app.route('/cpu_memory')
+@app.get('/api/cpu_memory')
 def cpu_memory():
-    cpu_memory_data = get_cpu_memory()
-    return jsonify(cpu_memory_data)
+    return jsonify(get_cpu_memory())
 
-@app.route('/storage')
+@app.get('/api/storage')
 def storage():
-    storage_data = get_storage()
-    return jsonify(storage_data)
+    return jsonify(get_storage())
 
-@app.route('/top_queries')
+@app.get('/api/top_queries')
 def top_queries():
-    queries_data = get_top_queries()
-    return jsonify(queries_data)
+    return jsonify(get_top_queries())
 
-@app.route('/last_backup')
+@app.get('/api/last_backup')
 def last_backup():
-    backup_data = get_last_backup()
-    return jsonify(backup_data)
+    return jsonify(get_last_backup())
 
-@app.route('/recalculate_stats')
+@app.post('/api/recalculate_stats')
 def recalculate_stats():
     recalculate_statistics()
     return jsonify({"message": "Estadísticas recalculadas exitosamente"})
 
-@app.route('/invalid_objects')
+@app.get('/api/invalid_objects')
 def invalid_objects():
-    invalid_objects_data = get_invalid_objects()
-    return jsonify(invalid_objects_data)
+    return jsonify(get_invalid_objects())
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(host='127.0.0.1', port=5000, debug=True)  # puerto fijo para el proxy

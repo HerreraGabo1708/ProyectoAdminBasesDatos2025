@@ -1,91 +1,214 @@
-import pyodbc
+import traceback
 from db import get_db_connection
 
+def _safe_fetchone(cur):
+    try:
+        row = cur.fetchone()
+        return row
+    except Exception:
+        return None
+
 def get_cpu_memory():
+    """Dejamos la versión que ya te funcionó (CPU ~100) + memoria realista."""
     conn = get_db_connection()
-    cursor = conn.cursor()
-    query = """
-        SELECT cpu_percent, memory_usage
-        FROM sys.dm_os_ring_buffers
-        WHERE ring_buffer_type = 'RING_BUFFER_SCHEDULER'
-        AND record_id = (SELECT MAX(record_id) FROM sys.dm_os_ring_buffers);
+    cur = conn.cursor()
+
+    # CPU (ring buffer, tu versión funcional)
+    cpu_sql = r"""
+    ;WITH parsed AS (
+      SELECT
+        CONVERT(xml, record).value('(./Record/@id)[1]','int') AS record_id,
+        CONVERT(xml, record).value('(./Record/SchedulerMonitorEvent/SystemHealth/SystemIdle)[1]','int') AS system_idle
+      FROM sys.dm_os_ring_buffers
+      WHERE ring_buffer_type = N'RING_BUFFER_SCHEDULER_MONITOR'
+        AND CAST(record AS nvarchar(max)) LIKE N'%<SystemHealth>%'
+    )
+    SELECT TOP 1 ISNULL(100 - system_idle, 100) AS overall_cpu
+    FROM parsed
+    ORDER BY record_id DESC;
     """
-    cursor.execute(query)
-    result = cursor.fetchone()
-    return {"cpu_usage": result[0], "memory_usage": result[1]}
+    try:
+        cur.execute(cpu_sql)
+        row = _safe_fetchone(cur)
+        cpu_usage = float(row[0]) if row and row[0] is not None else 100.0
+    except Exception:
+        cpu_usage = 100.0
+
+    # Memoria (más estable)
+    mem_usage = 0.0
+    try:
+        cur.execute("""
+          SELECT CAST(100.0 * committed_kb / NULLIF(committed_target_kb,0) AS float)
+          FROM sys.dm_os_sys_info;
+        """)
+        row = _safe_fetchone(cur)
+        if row and row[0] is not None:
+            mem_usage = float(row[0])
+        else:
+            raise Exception("sys_info null")
+    except Exception:
+        try:
+            cur.execute("SELECT memory_utilization_percentage FROM sys.dm_os_process_memory;")
+            row = _safe_fetchone(cur)
+            mem_usage = float(row[0]) if row and row[0] is not None else 0.0
+        except Exception:
+            mem_usage = 0.0
+
+    # Clamp 0..100
+    cpu_usage = max(0.0, min(100.0, cpu_usage))
+    mem_usage = max(0.0, min(100.0, mem_usage))
+    return {"cpu_usage": cpu_usage, "memory_usage": mem_usage}
 
 def get_storage():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    query = """
-        SELECT df.name AS FileName, df.size / 128.0 AS SizeMB
-        FROM sys.master_files df;
     """
-    cursor.execute(query)
-    result = cursor.fetchall()
-    storage_data = [{"file_name": row[0], "size_mb": row[1]} for row in result]
-    return storage_data
+    Tamaño de archivos por base, en MB.
+    size = páginas de 8KB, por eso /128 -> MB
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    sql = """
+    SELECT
+        DB_NAME(mf.database_id)     AS database_name,
+        mf.name                     AS file_name,
+        mf.type_desc                AS file_type,
+        mf.physical_name            AS physical_name,
+        CAST(mf.size/128.0 AS decimal(18,2)) AS size_mb
+    FROM sys.master_files AS mf
+    ORDER BY mf.database_id, mf.file_id;
+    """
+    try:
+        cur.execute(sql)
+        rows = cur.fetchall()
+        return [
+            {
+                "database_name": r[0],
+                "file_name": r[1],
+                "file_type": r[2],
+                "physical_name": r[3],
+                "size_mb": float(r[4]),
+            } for r in rows
+        ]
+    except Exception as e:
+        return {"error": "storage_failed", "detail": str(e), "trace": traceback.format_exc()}
 
-def get_top_queries():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    query = """
-        SELECT TOP 5
-            total_worker_time / 1000.0 AS total_cpu_time_ms,
-            execution_count,
-            total_worker_time,
-            total_elapsed_time / 1000.0 AS total_elapsed_time_seconds,
-            (total_worker_time / execution_count) / 1000.0 AS avg_cpu_time_ms,
-            SUBSTRING(qt.text, statement_start_offset / 2, 
-                (CASE 
-                    WHEN statement_end_offset = -1 
-                    THEN LEN(CONVERT(NVARCHAR(MAX), qt.text)) * 2 
-                    ELSE statement_end_offset 
-                END - statement_start_offset) / 2) AS query_text
-        FROM sys.dm_exec_query_stats AS qs
-        CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) AS qt
-        ORDER BY total_worker_time DESC;
+def get_top_queries(top_n: int = 5):
     """
-    cursor.execute(query)
-    result = cursor.fetchall()
-    queries_data = [{"cpu_time_ms": row[0], "query": row[5]} for row in result]
-    return queries_data
+    TOP consultas por CPU (total_worker_time). Devuelve texto y CPU acumulada.
+    Requiere VIEW SERVER STATE.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    sql = f"""
+    SELECT TOP ({top_n})
+        (qs.total_worker_time/1000.0)                                     AS total_cpu_time_ms,
+        qs.execution_count,
+        (qs.total_worker_time/NULLIF(qs.execution_count,0))/1000.0        AS avg_cpu_time_ms,
+        SUBSTRING(qt.text,
+                  (qs.statement_start_offset/2) + 1,
+                  (CASE WHEN qs.statement_end_offset = -1
+                        THEN LEN(CONVERT(NVARCHAR(MAX), qt.text)) * 2
+                        ELSE qs.statement_end_offset END
+                   - qs.statement_start_offset)/2 + 1)                    AS query_text
+    FROM sys.dm_exec_query_stats AS qs
+    CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) AS qt
+    ORDER BY qs.total_worker_time DESC;
+    """
+    try:
+        cur.execute(sql)
+        rows = cur.fetchall()
+        return [
+            {
+                "cpu_time_ms": float(r[0]) if r[0] is not None else 0.0,
+                "execution_count": int(r[1]) if r[1] is not None else 0,
+                "avg_cpu_time_ms": float(r[2]) if r[2] is not None else 0.0,
+                "query": (r[3] or "").strip()
+            } for r in rows
+        ]
+    except Exception as e:
+        return {"error": "top_queries_failed", "detail": str(e), "trace": traceback.format_exc()}
 
 def get_last_backup():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    query = """
-        SELECT
-            database_name,
-            MAX(backup_finish_date) AS LastBackupDate
-        FROM msdb.dbo.backupset
-        WHERE type = 'D'
-        GROUP BY database_name;
     """
-    cursor.execute(query)
-    result = cursor.fetchall()
-    backup_data = [{"database_name": row[0], "last_backup": row[1]} for row in result]
-    return backup_data
+    Último backup completo (D) por base. Requiere acceso a msdb.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    sql = """
+    SELECT
+        bs.database_name,
+        MAX(bs.backup_finish_date) AS last_backup
+    FROM msdb.dbo.backupset AS bs
+    WHERE bs.type = 'D'
+    GROUP BY bs.database_name
+    ORDER BY bs.database_name;
+    """
+    try:
+        cur.execute(sql)
+        rows = cur.fetchall()
+        return [
+            {
+                "database_name": r[0],
+                "last_backup": r[1].isoformat() if r[1] is not None else None
+            } for r in rows
+        ]
+    except Exception as e:
+        return {"error": "last_backup_failed", "detail": str(e), "trace": traceback.format_exc()}
 
 def recalculate_statistics():
+    """
+    Actualiza estadísticas en todas las bases actuales (sp_updatestats por DB).
+    Ejecutar como POST en la API.
+    """
     conn = get_db_connection()
-    cursor = conn.cursor()
-    query = "EXEC sp_updatestats;"
-    cursor.execute(query)
-    conn.commit()
+    cur = conn.cursor()
+    try:
+        # Itera DBs de usuario (excluye tempdb y bases del sistema)
+        cur.execute("""
+          SELECT name
+          FROM sys.databases
+          WHERE database_id > 4  -- 1..4 = master, tempdb, model, msdb
+            AND state = 0;       -- ONLINE
+        """)
+        dbs = [row[0] for row in cur.fetchall()]
+        for db in dbs:
+            cur.execute(f"EXEC [{db}].sys.sp_updatestats;")
+        conn.commit()
+        return {"message": "Estadísticas recalculadas exitosamente", "databases": dbs}
+    except Exception as e:
+        conn.rollback()
+        return {"error": "recalculate_failed", "detail": str(e), "trace": traceback.format_exc()}
 
 def get_invalid_objects():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    query = """
-        SELECT 
-            OBJECT_NAME(object_id) AS object_name,
-            type_desc
-        FROM sys.objects
-        WHERE is_ms_shipped = 0
-          AND OBJECTPROPERTY(object_id, 'IsValid') = 0;
     """
-    cursor.execute(query)
-    result = cursor.fetchall()
-    invalid_objects = [{"object_name": row[0], "type": row[1]} for row in result]
-    return invalid_objects
+    'Objetos inválidos': objetos con dependencias no resueltas (vista/proc que referencia algo que no existe).
+    Esto emula el concepto de 'invalid objects' de Oracle.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    sql = """
+    SELECT
+        OBJECT_SCHEMA_NAME(d.referencing_id) AS schema_name,
+        OBJECT_NAME(d.referencing_id)        AS object_name,
+        o.type_desc,
+        d.referenced_entity_name             AS missing_reference
+    FROM sys.sql_expression_dependencies AS d
+    JOIN sys.objects AS o
+      ON o.object_id = d.referencing_id
+    WHERE d.referenced_id IS NULL                 -- referencia no resuelta
+      AND d.is_ambiguous = 0
+      AND o.is_ms_shipped = 0
+    ORDER BY schema_name, object_name;
+    """
+    try:
+        cur.execute(sql)
+        rows = cur.fetchall()
+        return [
+            {
+                "schema": r[0],
+                "object_name": r[1],
+                "type": r[2],
+                "missing_reference": r[3]
+            } for r in rows
+        ]
+    except Exception as e:
+        return {"error": "invalid_objects_failed", "detail": str(e), "trace": traceback.format_exc()}
